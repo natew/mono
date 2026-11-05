@@ -68,6 +68,10 @@ manifest.releaseSourceCommit = source;
 manifest.upstreamVersion = '1.9.0';
 manifest.upstreamIntegrity = integrity;
 manifest.files.push('LICENSE', 'MAINTAINED.md');
+if (process.argv.includes('--client')) {
+  const {clientPackage} = await import('./client-package.ts');
+  console.error(JSON.stringify(clientPackage(pkg, manifest)));
+}
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 copyFileSync(join(here, '..', 'LICENSE'), join(pkg, 'LICENSE'));
 copyFileSync(join(here, 'README.md'), join(pkg, 'MAINTAINED.md'));
