@@ -1,0 +1,156 @@
+diff --git a/out/replicache/src/replicache-impl.js b/out/replicache/src/replicache-impl.js
+index 1d08adc..6c545ba 100644
+--- a/out/replicache/src/replicache-impl.js
++++ b/out/replicache/src/replicache-impl.js
+@@ -16,7 +16,7 @@ import { newWriteLocal } from "./db/write.js";
+ import { withRead, withWrite, withWriteNoImplicitCommit } from "./with-transactions.js";
+ import { disableClientGroup } from "./persist/client-groups.js";
+ import { makeClientID } from "./persist/make-client-id.js";
+-import { ClientStateNotFoundError, hasClientState, initClientV6 } from "./persist/clients.js";
++import { ClientStateNotFoundError, hasClientState, initClientV6, getClient, assertClientV6, setClient } from "./persist/clients.js";
+ import { getKVStoreProvider } from "./get-kv-store-provider.js";
+ import { createLogContext } from "./log-options.js";
+ import { IDBDatabasesStore } from "./persist/idb-databases-store.js";
+@@ -109,6 +109,7 @@ var ReplicacheImpl = class {
+ 		};
+ 	}
+ 	#closed = false;
++	#refreshes = new Set();
+ 	#online = true;
+ 	#clientID = makeClientID();
+ 	#ready;
+@@ -363,20 +364,33 @@ var ReplicacheImpl = class {
+ 		this.#closed = true;
+ 		const { promise, resolve } = resolver();
+ 		closingInstances.set(this.name, promise);
+-		this.#closeAbortController.abort();
+-		getBrowserGlobal("document")?.removeEventListener("visibilitychange", this.#onVisibilityChange);
+-		await this.#ready;
+-		const closingPromises = [
+-			this.memdag.close(),
+-			this.perdag.close(),
+-			this.#idbDatabases.close()
+-		];
+-		this.#pullConnectionLoop.close();
+-		this.#pushConnectionLoop.close();
+-		this.#subscriptions.clear();
+-		await Promise.all(closingPromises);
+-		closingInstances.delete(this.name);
+-		resolve();
++		try {
++			this.#closeAbortController.abort();
++			getBrowserGlobal("document")?.removeEventListener("visibilitychange", this.#onVisibilityChange);
++			await this.#ready;
++			await Promise.allSettled([...this.#refreshes]);
++			await this.#persistLock.withLock(() => promiseVoid);
++			try {
++				// drain readers before collecting chunks still needed by their lazy reads.
++				await withWriteNoImplicitCommit(this.memdag, () => withWrite(this.perdag, async write => {
++					const client = await getClient(this.clientID, write);
++					if (!client) return;
++					assertClientV6(client);
++					// retain identity and the group containing persisted unacknowledged mutations.
++					await setClient(this.clientID, {...client, refreshHashes: [], persistHash: null}, write);
++				}));
++			} catch (error) {
++				this.#lc.debug?.("Failed to release snapshot pins during close", error);
++			}
++			const closingPromises = [this.memdag.close(), this.perdag.close(), this.#idbDatabases.close()];
++			this.#pullConnectionLoop.close();
++			this.#pushConnectionLoop.close();
++			this.#subscriptions.clear();
++			await Promise.all(closingPromises);
++		} finally {
++			closingInstances.delete(this.name);
++			resolve();
++		}
+ 	}
+ 	async maybeEndPull(syncHead, requestID) {
+ 		for (;;) {
+@@ -629,7 +643,12 @@ var ReplicacheImpl = class {
+ 			});
+ 		});
+ 	}
+-	async refresh() {
++	refresh() {
++		const running = this.#refresh().finally(() => this.#refreshes.delete(running));
++		this.#refreshes.add(running);
++		return running;
++	}
++	async #refresh() {
+ 		await this.#ready;
+ 		const { clientID } = this;
+ 		if (this.#closed || !this.#enableRefresh()) return;
+diff --git a/out/replicache/src/persist/collect-idb-databases.js b/out/replicache/src/persist/collect-idb-databases.js
+index 20d38e2..d4aada1 100644
+--- a/out/replicache/src/persist/collect-idb-databases.js
++++ b/out/replicache/src/persist/collect-idb-databases.js
+@@ -48,10 +48,17 @@ async function collectIDBDatabases(idbDatabasesStore, now, maxAge, kvStoreProvid
+ 	if (errors.length) throw errors[0];
+ 	if (deletedClientsToRemove.length > 0) {
+ 		let allDeletedClients = deletedClientsToRemove;
+-		for (const name of dbNamesToKeep) await withWrite(newDagStore(name, kvStoreProvider.create), async (dagWrite) => {
+-			const newDeletedClients = await addDeletedClients(dagWrite, deletedClientsToRemove);
+-			allDeletedClients = mergeDeletedClients(allDeletedClients, newDeletedClients);
+-		});
++		for (const name of dbNamesToKeep) {
++			const store = newDagStore(name, kvStoreProvider.create);
++			try {
++				await withWrite(store, async (dagWrite) => {
++					const newDeletedClients = await addDeletedClients(dagWrite, deletedClientsToRemove);
++					allDeletedClients = mergeDeletedClients(allDeletedClients, newDeletedClients);
++				});
++			} finally {
++				await store.close();
++			}
++		}
+ 		await onClientsDeleted(normalizeDeletedClients(allDeletedClients));
+ 	}
+ }
+@@ -80,10 +87,15 @@ function defaultNewDagStore(name, kvCreateStore) {
+ * If any client has a recent heartbeat or there are pending mutations we
+ * return `[false]`. Otherwise we return `[true, deletedClients]`.
+ */
+-function gatherDatabaseInfoForCollect(db, now, maxAge, enableMutationRecovery, kvCreateStore, newDagStore) {
++async function gatherDatabaseInfoForCollect(db, now, maxAge, enableMutationRecovery, kvCreateStore, newDagStore) {
+ 	if (db.replicacheFormatVersion > 7) return [false];
+ 	assert(db.replicacheFormatVersion === 5 || db.replicacheFormatVersion === 6 || db.replicacheFormatVersion === 7, () => `Expected replicacheFormatVersion to be DD31, V6, or V7, got ${db.replicacheFormatVersion}`);
+-	return canDatabaseBeCollectedAndGetDeletedClientIDs(enableMutationRecovery, newDagStore(db.name, kvCreateStore), now, maxAge);
++	const store = newDagStore(db.name, kvCreateStore);
++	try {
++		return await canDatabaseBeCollectedAndGetDeletedClientIDs(enableMutationRecovery, store, now, maxAge);
++	} finally {
++		await store.close();
++	}
+ }
+ /**
+ * Drops the specified database.
+@@ -92,7 +104,12 @@ function gatherDatabaseInfoForCollect(db, now, maxAge, enableMutationRecovery, k
+ */
+ async function dropDatabase(dbName, opts) {
+ 	const kvStoreProvider = getKVStoreProvider(createLogContext(opts?.logLevel, opts?.logSinks, { dropDatabase: void 0 }), opts?.kvStore);
+-	await dropDatabaseInternal(dbName, new IDBDatabasesStore(kvStoreProvider.create), kvStoreProvider.drop);
++	const store = new IDBDatabasesStore(kvStoreProvider.create);
++	try {
++		await dropDatabaseInternal(dbName, store, kvStoreProvider.drop);
++	} finally {
++		await store.close();
++	}
+ }
+ /**
+ * Deletes all IndexedDB data associated with Replicache.
+@@ -103,8 +120,12 @@ async function dropDatabase(dbName, opts) {
+ async function dropAllDatabases(opts) {
+ 	const kvStoreProvider = getKVStoreProvider(createLogContext(opts?.logLevel, opts?.logSinks, { dropAllDatabases: void 0 }), opts?.kvStore);
+ 	const store = new IDBDatabasesStore(kvStoreProvider.create);
+-	const databases = await store.getDatabases();
+-	return dropDatabases(store, Object.values(databases).map((db) => db.name), kvStoreProvider.drop);
++	try {
++		const databases = await store.getDatabases();
++		return await dropDatabases(store, Object.values(databases).map((db) => db.name), kvStoreProvider.drop);
++	} finally {
++		await store.close();
++	}
+ }
+ /**
+ * If there are pending mutations in any of the clients in this db we return
