@@ -41,3 +41,27 @@ The latest stable 1.11.4 and canary 1.12.0-canary.12 were inspected on November 
 2026 and contain neither repair. They use protocols 53 and 57 respectively, so
 this backport avoids an unrelated protocol migration. Replace this fork with an
 official release once it includes the repairs and its protocol is supported.
+
+## Client-only artifact
+
+Applications that do not run Zero's server tools can use `@natew/zero-client`.
+It preserves the patched client runtime and declarations, protocol and storage
+format. Its exports are the main client, React, Solid, React Native, Expo SQLite,
+OP SQLite, generic SQLite, change-protocol v0, bindings and server application
+query/mutation helpers. The Zero cache host, PostgreSQL adapters, analysis tools
+and executable commands remain available from the full `@natew/zero` package.
+
+Install the isolated builder dependency, then build into another empty directory:
+
+```sh
+npm ci --prefix maintained-zero --workspaces=false --ignore-scripts
+node --experimental-strip-types maintained-zero/build.ts /absolute/empty/output --client
+```
+
+The builder follows JavaScript and declaration imports from those exports and
+keeps their original bytes and available source maps. Only referenced runtime
+dependencies are installed. React, Solid and the two platform SQLite adapters
+are optional peers; an application using an adapter supplies that platform's
+package. Unknown or missing imports stop the build instead of silently producing
+an incomplete package. The existing integration probe also runs against the
+extracted client artifact after installing its ten direct runtime dependencies.
